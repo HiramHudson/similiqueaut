@@ -1,0 +1,236 @@
+import { API_URL, API_VERSION, MAX_CACHE_LAST_UPDATED_AT_SECONDS } from '../constants';
+// DO NOT CHANGE: Runtime needs to be imported as a default export so that we can stub its dependencies with Sinon.js
+// For more information refer to https://sinonjs.org/how-to/stub-dependency/
+import runtime from '../runtime';
+import { callWithRetry } from '../util/callWithRetry';
+import { joinPaths } from '../util/path';
+import { getErrorObjectByCode } from '../util/request';
+import {
+  TokenVerificationError,
+  TokenVerificationErrorAction,
+  TokenVerificationErrorCode,
+  TokenVerificationErrorReason,
+} from './errors';
+
+type JsonWebKeyWithKid = JsonWebKey & { kid: string };
+
+type JsonWebKeyCache = Record<string, JsonWebKeyWithKid>;
+
+let cache: JsonWebKeyCache = {};
+let lastUpdatedAt = 0;
+
+function getFromCache(kid: string) {
+  return cache[kid];
+}
+
+function setInCache(
+  jwk: JsonWebKeyWithKid,
+  jwksCacheTtlInMs: number = 1000 * 60 * 60, // 1 hour
+) {
+  cache[jwk.kid] = jwk;
+  lastUpdatedAt = Date.now();
+
+  if (jwksCacheTtlInMs >= 0) {
+    setTimeout(() => {
+      if (jwk) {
+        delete cache[jwk.kid];
+      } else {
+        cache = {};
+      }
+    }, jwksCacheTtlInMs);
+  }
+}
+
+const LocalJwkKid = 'local';
+const PEM_HEADER = '-----BEGIN PUBLIC KEY-----';
+const PEM_TRAILER = '-----END PUBLIC KEY-----';
+const RSA_PREFIX = 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA';
+const RSA_SUFFIX = 'IDAQAB';
+
+/**
+ *
+ * Loads a local PEM key usually from process.env and transform it to JsonWebKey format.
+ * The result is also cached on the module level to avoid unnecessary computations in subsequent invocations.
+ *
+ * @param {string} localKey
+ * @returns {JsonWebKey} key
+ */
+export function loadClerkJWKFromLocal(localKey?: string): JsonWebKey {
+  if (!getFromCache(LocalJwkKid)) {
+    if (!localKey) {
+      throw new TokenVerificationError({
+        action: TokenVerificationErrorAction.SetClerkJWTKey,
+        message: 'Missing local JWK.',
+        reason: TokenVerificationErrorReason.LocalJWKMissing,
+      });
+    }
+
+    const modulus = localKey
+      .replace(/(\r\n|\n|\r)/gm, '')
+      .replace(PEM_HEADER, '')
+      .replace(PEM_TRAILER, '')
+      .replace(RSA_PREFIX, '')
+      .replace(RSA_SUFFIX, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_');
+
+    // JWK https://datatracker.ietf.org/doc/html/rfc7517
+    setInCache(
+      {
+        kid: 'local',
+        kty: 'RSA',
+        alg: 'RS256',
+        n: modulus,
+        e: 'AQAB',
+      },
+      -1, // local key never expires in cache
+    );
+  }
+
+  return getFromCache(LocalJwkKid);
+}
+
+export type LoadClerkJWKFromRemoteOptions = {
+  kid: string;
+  jwksCacheTtlInMs?: number;
+  skipJwksCache?: boolean;
+  secretKey?: string;
+  /**
+   * @deprecated Use `secretKey` instead.
+   */
+  apiKey?: string;
+  apiUrl?: string;
+  apiVersion?: string;
+  issuer?: string;
+};
+
+/**
+ *
+ * Loads a key from JWKS retrieved from the well-known Frontend API endpoint of the issuer.
+ * The result is also cached on the module level to avoid network requests in subsequent invocations.
+ * The cache lasts 1 hour by default.
+ *
+ * @param {Object} options
+ * @param {string} options.issuer - The issuer origin of the JWT
+ * @param {string} options.kid - The id of the key that the JWT was signed with
+ * @param {string} options.alg - The algorithm of the JWT
+ * @param {number} options.jwksCacheTtlInMs - The TTL of the jwks cache (defaults to 1 hour)
+ * @returns {JsonWebKey} key
+ */
+export async function loadClerkJWKFromRemote({
+  apiKey,
+  secretKey,
+  apiUrl = API_URL,
+  apiVersion = API_VERSION,
+  issuer,
+  kid,
+  jwksCacheTtlInMs = 1000 * 60 * 60, // 1 hour,
+  skipJwksCache,
+}: LoadClerkJWKFromRemoteOptions): Promise<JsonWebKey> {
+  const shouldRefreshCache = !getFromCache(kid) && reachedMaxCacheUpdatedAt();
+  if (skipJwksCache || shouldRefreshCache) {
+    let fetcher;
+    const key = secretKey || apiKey;
+
+    if (key) {
+      fetcher = () => fetchJWKSFromBAPI(apiUrl, key, apiVersion);
+    } else if (issuer) {
+      fetcher = () => fetchJWKSFromFAPI(issuer);
+    } else {
+      throw new TokenVerificationError({
+        action: TokenVerificationErrorAction.ContactSupport,
+        message: 'Failed to load JWKS from Clerk Backend or Frontend API.',
+        reason: TokenVerificationErrorReason.RemoteJWKFailedToLoad,
+      });
+    }
+
+    const { keys }: { keys: JsonWebKeyWithKid[] } = await callWithRetry(fetcher);
+
+    if (!keys || !keys.length) {
+      throw new TokenVerificationError({
+        action: TokenVerificationErrorAction.ContactSupport,
+        message: 'The JWKS endpoint did not contain any signing keys. Contact support@clerk.com.',
+        reason: TokenVerificationErrorReason.RemoteJWKFailedToLoad,
+      });
+    }
+
+    keys.forEach(key => setInCache(key, jwksCacheTtlInMs));
+  }
+
+  const jwk = getFromCache(kid);
+
+  if (!jwk) {
+    throw new TokenVerificationError({
+      action: TokenVerificationErrorAction.ContactSupport,
+      message: `Unable to find a signing key in JWKS that matches the kid='${kid}' of the provided session token. Please make sure that the __session cookie or the HTTP authorization header contain a Clerk-generated session JWT.`,
+      reason: TokenVerificationErrorReason.RemoteJWKMissing,
+    });
+  }
+
+  return jwk;
+}
+
+async function fetchJWKSFromFAPI(issuer: string) {
+  const url = new URL(issuer);
+  url.pathname = joinPaths(url.pathname, '.well-known/jwks.json');
+
+  const response = await runtime.fetch(url.href);
+
+  if (!response.ok) {
+    throw new TokenVerificationError({
+      action: TokenVerificationErrorAction.ContactSupport,
+      message: `Error loading Clerk JWKS from ${url.href} with code=${response.status}`,
+      reason: TokenVerificationErrorReason.RemoteJWKFailedToLoad,
+    });
+  }
+
+  return response.json();
+}
+
+async function fetchJWKSFromBAPI(apiUrl: string, key: string, apiVersion: string) {
+  if (!key) {
+    throw new TokenVerificationError({
+      action: TokenVerificationErrorAction.SetClerkSecretKeyOrAPIKey,
+      message:
+        'Missing Clerk Secret Key or API Key. Go to https://dashboard.clerk.com and get your key for your instance.',
+      reason: TokenVerificationErrorReason.RemoteJWKFailedToLoad,
+    });
+  }
+
+  const url = new URL(apiUrl);
+  url.pathname = joinPaths(url.pathname, apiVersion, '/jwks');
+
+  const response = await runtime.fetch(url.href, {
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const json = await response.json();
+    const invalidSecretKeyError = getErrorObjectByCode(json?.errors, TokenVerificationErrorCode.InvalidSecretKey);
+
+    if (invalidSecretKeyError) {
+      const reason = TokenVerificationErrorReason.InvalidSecretKey;
+
+      throw new TokenVerificationError({
+        action: TokenVerificationErrorAction.ContactSupport,
+        message: invalidSecretKeyError.message,
+        reason,
+      });
+    }
+
+    throw new TokenVerificationError({
+      action: TokenVerificationErrorAction.ContactSupport,
+      message: `Error loading Clerk JWKS from ${url.href} with code=${response.status}`,
+      reason: TokenVerificationErrorReason.RemoteJWKFailedToLoad,
+    });
+  }
+
+  return response.json();
+}
+
+function reachedMaxCacheUpdatedAt() {
+  return Date.now() - lastUpdatedAt >= MAX_CACHE_LAST_UPDATED_AT_SECONDS * 1000;
+}

@@ -1,0 +1,68 @@
+{
+  "name": "@clerk/remix",
+  "version": "2.9.1",
+  "license": "MIT",
+  "description": "Clerk SDK for Remix",
+  "keywords": [
+    "clerk",
+    "typescript",
+    "remix",
+    "auth",
+    "authentication",
+    "passwordless",
+    "session",
+    "jwt"
+  ],
+  "author": "Clerk",
+  "main": "dist/index.js",
+  "typings": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "api.server.d.ts",
+    "api.server.js",
+    "ssr.server.d.ts",
+    "ssr.server.js"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "clean": "rimraf ./dist",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@clerk/backend": "^0.27.0",
+    "@clerk/clerk-react": "^4.23.2",
+    "@clerk/shared": "^0.21.0",
+    "@clerk/types": "^3.49.0",
+    "cookie": "0.5.0",
+    "tslib": "2.4.1"
+  },
+  "devDependencies": {
+    "@types/cookie": "^0.5.0",
+    "@types/node": "^16.11.55",
+    "@types/react": "*",
+    "@types/react-dom": "*",
+    "typescript": "*"
+  },
+  "peerDependencies": {
+    "@remix-run/react": "^1.7.6",
+    "@remix-run/server-runtime": "^1.7.6",
+    "react": ">=16.8",
+    "react-dom": ">=16.8"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clerkinc/javascript.git"
+  },
+  "bugs": {
+    "url": "https://github.com/clerkinc/javascript/issues"
+  },
+  "homepage": "https://clerk.com/",
+  "gitHead": "1b19a43b61f712756ab4d8c9ccbee6e8bddbe4ce"
+}
